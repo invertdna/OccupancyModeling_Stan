@@ -1,0 +1,295 @@
+---
+title: "Occupancy Modeling Explained"
+author: "Kelly"
+date: "3/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(rstan)
+library(shinystan)
+library(bayesplot)
+library(broom)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+set.seed(108)
+setwd(here())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Occupancy Modeling
+
+Ecological studies often face a version of the following problem: ``how do I know if a species is present at this site or not?'' 
+
+If we assume we have perfect detection capabilities, the answer is easy: any time you detect the species, it is present, and otherwise, it is absent. But of course, detection is imperfect. In particular, we are concerned with false-positive detections (i.e., the species is truly absent, but we detect it) and false-negative detections (the species is truly present, but we fail to detect it). 
+
+[Note: Key references here are Royle & Link 2006, and papers cited therein. In the context of eDNA, see Lahoz-Monfort et al. 2016 and surrounding papers.]
+
+## Detectability
+
+A simple approach to the problem is to neglect false-positives, and capture a false-negative rate by saying the `detectability' of the species is less than perfect. So, for example, we say there's a 50\% likelihood of detecting our species where it is, in fact present. And say we detect it in 4 out of 10 tries. 
+
+The likelihood of it being truly present (that is, occupying the sampled site) is:
+
+The probability of getting 4 detections out of 10 tries, when the probability of detection in each try is 0.5
+
+```r
+  pbinom(4, 10, prob = 0.5) %>% 
+    round(3)
+```
+
+`r pbinom(4, 10, prob = 0.5) %>% round(3)`
+
+
+But that's pretty unsatisfying, right?  I mean, we detected it 4 times, and yet we think it has only a 38% chance of really being there? 
+
+(In eDNA and other similar studies, the equivalent is detecting a taxon or a sequence in 1 out of 3 technical replicates... do you think it real or not?  And this is a much more general classification problem, with applications all over the place.)
+
+```{r}
+#we can plot the probability of all possible outcomes this way:
+plot(x= c(0:10), 
+     y=pbinom(c(0:10), size=10, prob=0.5), 
+     pch=19, xlab="Detections out of 10 replicates", ylab="Naive Probability of Occupancy",
+     type = "b")
+
+```
+
+
+
+
+
+## Identifying What You Don't Know
+All told, to make good sense of presence/absence data (or more correctly, detection/non-detection data), we need to understand three parameters:
+
+  - P11 (True-Positive Rate, between 0 and 1)
+  - P10 (False-Positive Rate, between 0 and 1)
+  - Psi (How overall common the species is, between 0 and 1)
+  
+The world has two possible states: 
+
+  - Where the target species is truly present, and
+  - Where the target species is truly absent. 
+  
+We don't know which of these is true, and so, the probability of detecting our species is:
+
+```r
+  prob = 
+    (Psi * P11) #commonness (overall likelihood of it being there) times the true-positive rate (the likelihood of detecting it, given that it is truly present)
+    + 
+    ((1-Psi)*P10) #the inverse of commonness (likelihood of it NOT being there) times the false-positive rate (the likelihood of detecting it, given that it is NOT truly present)
+```
+
+Using the binomial probability distribution as we did above, we can create a function for inferring occupancy given `x` detections in `K` tries. 
+
+```{r}
+ProbOcc=function(x, psi=psi, p11=p11, p10=p10, K=K){
+			(psi*(p11^x)*(1-p11)^(K-x)) / ((psi*(p11^x)*(1-p11)^(K-x))+(((1-psi)*(p10^x))*((1-p10)^(K-x))))
+			}
+			
+			#where x == number of detections and K == number of tries (replicates)
+      #this equation directly from Lahoz-Monfort et al. 2016
+```
+
+
+
+We then need to use the data we have in hand -- presence/absence -- to infer the values for our parameters P11, P10, and Psi.  If we can do that, we will have a good sense of whether the species is truly present in the sampled place... but MORE THAN THIS, we will have a sense of our assay's error rates. Which is all useful information. 
+
+So, how to estimate these parameters? 
+
+## Estimating Parameters
+
+This is where the Bayesian inference comes in. We have data, and we're trying to infer the likelihood of each parameter value, in light of the data we have in hand. In addition, we have some outside (prior) information: if our assay is any good at all, we think that our false-positive rate (p10) is much lower than our true-positive rate (p11). We can express this belief in drawing candidate parameter values from distribution that reflect these properties. 
+
+We can use repeated sampling to generate a dataset that lets us estimate our parameters with reasonable confidence. The assumption here is that each sample (e.g., bottle of water, technical replicate, or other sampling event) provides an independent test of the assay.
+
+Say we have the following dataset, where `1` indicates detection and `0` indicates non-detection, and where each row is a different sample/site, and columns are technical replicates for those samples. 
+
+```{r}
+species_A<-matrix(data=c(
+  rbinom(10,1,.8),
+  rbinom(10,1,.8),
+  rbinom(10,1,.8),
+  rbinom(10,1,.8),
+  rbinom(10,1,.3),
+  rbinom(10,1,0)),
+  ncol=10, byrow=T
+)
+
+species_A
+#the species is clearly present at the first few sites, absent at the bottom, and maybe questionable at one
+
+```
+
+We can then use Stan, a powerful language for Bayesian inference that works well with **R**, to sample from prior distributions for our parameters and generate posterior estimates for them. 
+
+## Estimating Posteriors in Stan 
+
+Stan actually does its work in C++, so it has to write out a program to a file (outside of **R**) and compile it to run at a deeper level of your computer's architecture. This takes a little while the first time you compile a given set of Stan code, but only needs to be redone if you change the Stan code.  
+
+
+[Note the `sink()` function here doesn't play well with `knitr`, and so you probably have to run these code chunks by hand to get them to run]
+
+```{r}
+##Stan Model
+modelText <- "data{/////////////////////////////////////////////////////////////////////
+    int<lower=1> S;    // number of sites or samples (nrow)
+    int<lower=1> K[S];   // number of replicates per site (ncol)
+    int<lower=0> N[S]; // detected or not at that site/replicate
+    int z[S];   
+}
+
+parameters{/////////////////////////////////////////////////////////////////////
+    real<lower=0,upper=1> psi;  //commonness parameter
+    real<lower=0,upper=1> p11; //true positive detection rate
+    real<lower=0,upper=1> p10; //false positive detection rate
+}
+
+transformed parameters{/////////////////////////////////////////////////////////////////////
+}
+
+model{/////////////////////////////////////////////////////////////////////
+  real p[S];
+  
+    for (i in 1:S){
+			z[i] ~ bernoulli(psi);
+			p[i] = z[i]*p11 + (1-z[i])*p10;
+			N[i] ~ binomial(K[i], p[i]);
+	}; 
+  
+  //priors
+  psi ~ beta(5,5); 
+  p11 ~ beta(5,5); 
+  p10 ~ beta(1,50);
+}
+
+generated quantities{
+  real<lower=0,upper=1> Occupancy_prob[S];    //after inferring parameters above, now calculate occupancy probability for each observation. Equation from Lahoz-Monfort et al. 2015
+
+  for (i in 1:S){
+       Occupancy_prob[i]  = (psi*(p11^N[i])*(1-p11)^(K[i]-N[i])) 
+       / ((psi*(p11^N[i])*(1-p11)^(K[i]-N[i])) 
+          + (((1-psi)*(p10^N[i]))*((1-p10)^(K[i]-N[i])))
+         );
+      }
+}
+
+"
+
+write.table(modelText, "Stan_SOM_demo.stan", row.names = F, quote = F, col.names = F)
+```
+
+
+We then call the Stan code to work on the dataset we created above. 
+
+```{r}
+#reformatting our simulated data from above to match the Stan code's inputs
+testData <- 
+  data.frame(K = 10,   #trials per site (row)
+         N = rowSums(species_A),  #detections per site
+         z = ifelse(rowSums(species_A) > 0, 1, 0)  #was it ever detected at this site? (integer that helps estimate psi)
+         )
+
+mySOMmodel <- stan(file = "Stan_SOM_demo.stan", 
+                             data = list(
+                               S = nrow(testData),
+                               K = testData$K,
+                               N = testData$N,
+                               z = ifelse(testData$N > 0, 1, 0)
+                             ), 
+                             chains = 4,   #number of chains
+                             iter = 4000   #number of iterations per chain
+       )
+```
+
+We now have posterior estimates for each of our parameters, and also for the probability of occupancy at each of the sampled sites. Importantly, we also have credibility intervals for each of these estimates. 
+
+```{r}
+tidy(mySOMmodel)
+
+mcmc_areas(mySOMmodel, 
+          pars = c("psi", "p11", "p10"))
+
+
+mcmc_intervals(mySOMmodel, 
+          regex_pars = "Occupancy_prob")
+```
+
+
+And we can then explore the posterior occupancy probability for all possible outcomes of 10 trials, given these parameters:
+
+```{r}
+modelText <- "data{/////////////////////////////////////////////////////////////////////
+    int<lower=1> S;    // number of sites or samples (nrow)
+    int<lower=1> K[S];   // number of replicates per site (ncol)
+    int<lower=0> N[S]; // detected or not at that site/replicate
+    int z[S];   
+}
+
+parameters{/////////////////////////////////////////////////////////////////////
+    real<lower=0,upper=1> psi;  //commonness parameter
+    real<lower=0,upper=1> p11; //true positive detection rate
+    real<lower=0,upper=1> p10; //false positive detection rate
+}
+
+transformed parameters{/////////////////////////////////////////////////////////////////////
+}
+
+model{/////////////////////////////////////////////////////////////////////
+  real p[S];
+  
+    for (i in 1:S){
+			z[i] ~ bernoulli(psi);
+			p[i] = z[i]*p11 + (1-z[i])*p10;
+			N[i] ~ binomial(K[i], p[i]);
+	}; 
+  
+  //priors
+  psi ~ beta(5,5); 
+  p11 ~ beta(5,5); 
+  p10 ~ beta(1,50);
+}
+
+generated quantities{
+    real<lower=0,upper=1> Occupancy_prob[11];    //after inferring parameters above, now calculate occupancy probability for each observation. Equation from Lahoz-Monfort et al. 2015
+
+  for (i in 0:10){
+       Occupancy_prob[i+1]  = (psi*(p11^i)*(1-p11)^(10-i)) 
+       / ((psi*(p11^i)*(1-p11)^(10-i)) 
+          + (((1-psi)*(p10^i))*((1-p10)^(10-i)))
+         );
+      }
+}
+
+"
+
+write.table(modelText, "Stan_SOM_allPossibilities.stan", row.names = F, quote = F, col.names = F)
+
+
+SOMmodel_0_10_detections <- stan(file = "Stan_SOM_allPossibilities.stan", 
+                             data = list(
+                               S = nrow(testData),
+                               K = testData$K,
+                               N = testData$N,
+                               z = ifelse(testData$N > 0, 1, 0)
+                             ), 
+                             chains = 4,   #number of chains
+                             iter = 4000   #number of iterations per chain
+       )
+
+```
+
+
+I can't figure out how to rotate this right now, but, this is the posterior equivalent of the binomial plot we had above, for which we had only a guess at our detectability parameter. 
+
+Given our p11, p10, and psi, if we get 0 or 1 detection out of 10, we can be pretty sure these are false positives. 3 out of 10 is right on the bubble of uncertainty, and anything 4 or more means the species is pretty well certainly there.
+
+```{r}
+mcmc_intervals(SOMmodel_0_10_detections, 
+          regex_pars = "Occupancy_prob") +
+  xlab("Probability of Occupancy") +
+  ylab("Number of detections (from 0 to 10 out of 10)")
+```
+
+
