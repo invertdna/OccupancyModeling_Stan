@@ -89,7 +89,7 @@ ProbOcc=function(x, psi=psi, p11=p11, p10=p10, K=K){
 			}
 			
 			#where x == number of detections and K == number of tries (replicates)
-      #this equation directly from Lahoz-Monfort et al. 2016
+      #this equation directly from Lahoz-Monfort et al. 2016; it's the probability a given sample came from an occupied site.
 ```
 
 
@@ -129,7 +129,7 @@ We can then use Stan, a powerful language for Bayesian inference that works well
 Stan actually does its work in C++, so it has to write out a program to a file (outside of **R**) and compile it to run at a deeper level of your computer's architecture. This takes a little while the first time you compile a given set of Stan code, but only needs to be redone if you change the Stan code.  
 
 
-[Note the `sink()` function here doesn't play well with `knitr`, and so you probably have to run these code chunks by hand to get them to run]
+(Note this is a version of the model with the latent state `z` marginalized out... that is, we can't force Stan to deal with discrete parameters, and here, we avoid including the (unobserved) state of the environment -- the true presence or absence of the species -- explicitly). 
 
 ```{r}
 ##Stan Model
@@ -137,7 +137,6 @@ modelText <- "data{/////////////////////////////////////////////////////////////
     int<lower=1> S;    // number of sites or samples (nrow)
     int<lower=1> K[S];   // number of replicates per site (ncol)
     int<lower=0> N[S]; // detected or not at that site/replicate
-    int z[S];   
 }
 
 parameters{/////////////////////////////////////////////////////////////////////
@@ -153,8 +152,7 @@ model{/////////////////////////////////////////////////////////////////////
   real p[S];
   
     for (i in 1:S){
-			z[i] ~ bernoulli(psi);
-			p[i] = z[i]*p11 + (1-z[i])*p10;
+			p[i] = psi*p11 + (1-psi)*p10;
 			N[i] ~ binomial(K[i], p[i]);
 	}; 
   
@@ -165,12 +163,12 @@ model{/////////////////////////////////////////////////////////////////////
 }
 
 generated quantities{
-  real<lower=0,upper=1> Occupancy_prob[S];    //after inferring parameters above, now calculate occupancy probability for each observation. Equation from Lahoz-Monfort et al. 2015
+    real<lower=0,upper=1> Occupancy_prob[11];    //after inferring parameters above, now calculate occupancy probability for each possible outcome (0 to 10 detections, out of 10), and give a posterior for the probability that a sample with that outcome came from an occupied habitat. Equation from Lahoz-Monfort et al. 2015
 
-  for (i in 1:S){
-       Occupancy_prob[i]  = (psi*(p11^N[i])*(1-p11)^(K[i]-N[i])) 
-       / ((psi*(p11^N[i])*(1-p11)^(K[i]-N[i])) 
-          + (((1-psi)*(p10^N[i]))*((1-p10)^(K[i]-N[i])))
+  for (i in 0:10){
+       Occupancy_prob[i+1]  = (psi*(p11^i)*(1-p11)^(10-i)) 
+       / ((psi*(p11^i)*(1-p11)^(10-i)) 
+          + (((1-psi)*(p10^i))*((1-p10)^(10-i)))
          );
       }
 }
@@ -206,87 +204,20 @@ mySOMmodel <- stan(file = "Stan_SOM_demo.stan",
 We now have posterior estimates for each of our parameters, and also for the probability of occupancy at each of the sampled sites. Importantly, we also have credibility intervals for each of these estimates. 
 
 ```{r}
-tidy(mySOMmodel)
 
 mcmc_areas(mySOMmodel, 
           pars = c("psi", "p11", "p10"))
 
-
-mcmc_intervals(mySOMmodel, 
-          regex_pars = "Occupancy_prob")
 ```
 
-
-And we can then explore the posterior occupancy probability for all possible outcomes of 10 trials, given these parameters:
-
-```{r}
-modelText <- "data{/////////////////////////////////////////////////////////////////////
-    int<lower=1> S;    // number of sites or samples (nrow)
-    int<lower=1> K[S];   // number of replicates per site (ncol)
-    int<lower=0> N[S]; // detected or not at that site/replicate
-    int z[S];   
-}
-
-parameters{/////////////////////////////////////////////////////////////////////
-    real<lower=0,upper=1> psi;  //commonness parameter
-    real<lower=0,upper=1> p11; //true positive detection rate
-    real<lower=0,upper=1> p10; //false positive detection rate
-}
-
-transformed parameters{/////////////////////////////////////////////////////////////////////
-}
-
-model{/////////////////////////////////////////////////////////////////////
-  real p[S];
-  
-    for (i in 1:S){
-			z[i] ~ bernoulli(psi);
-			p[i] = z[i]*p11 + (1-z[i])*p10;
-			N[i] ~ binomial(K[i], p[i]);
-	}; 
-  
-  //priors
-  psi ~ beta(5,5); 
-  p11 ~ beta(5,5); 
-  p10 ~ beta(1,50);
-}
-
-generated quantities{
-    real<lower=0,upper=1> Occupancy_prob[11];    //after inferring parameters above, now calculate occupancy probability for each observation. Equation from Lahoz-Monfort et al. 2015
-
-  for (i in 0:10){
-       Occupancy_prob[i+1]  = (psi*(p11^i)*(1-p11)^(10-i)) 
-       / ((psi*(p11^i)*(1-p11)^(10-i)) 
-          + (((1-psi)*(p10^i))*((1-p10)^(10-i)))
-         );
-      }
-}
-
-"
-
-write.table(modelText, "Stan_SOM_allPossibilities.stan", row.names = F, quote = F, col.names = F)
-
-
-SOMmodel_0_10_detections <- stan(file = "Stan_SOM_allPossibilities.stan", 
-                             data = list(
-                               S = nrow(testData),
-                               K = testData$K,
-                               N = testData$N,
-                               z = ifelse(testData$N > 0, 1, 0)
-                             ), 
-                             chains = 4,   #number of chains
-                             iter = 4000   #number of iterations per chain
-       )
-
-```
-
+And we can then explore the posterior occupancy probability for all possible outcomes of 10 trials, given these parameters.
 
 I can't figure out how to rotate this right now, but, this is the posterior equivalent of the binomial plot we had above, for which we had only a guess at our detectability parameter. 
 
 Given our p11, p10, and psi, if we get 0 or 1 detection out of 10, we can be pretty sure these are false positives. 3 out of 10 is right on the bubble of uncertainty, and anything 4 or more means the species is pretty well certainly there.
 
 ```{r}
-mcmc_intervals(SOMmodel_0_10_detections, 
+mcmc_intervals(mySOMmodel, 
           regex_pars = "Occupancy_prob") +
   xlab("Probability of Occupancy") +
   ylab("Number of detections (from 0 to 10 out of 10)")
